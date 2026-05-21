@@ -354,7 +354,7 @@ class App(tk.Tk):
         self._analyze_btn = self._flat_button(
             bar, "🔍  开始分析", self._start_analysis,
             bg=PRIMARY, fg="#FFFFFF", padx=32, pady=10,
-            font=self.font_btn,
+            label_font=self.font_btn,
         )
         self._analyze_btn.pack(side="right")
 
@@ -431,12 +431,12 @@ class App(tk.Tk):
         self, parent, text: str, command,
         bg: str = SURFACE, fg: str = TEXT,
         padx: int = 12, pady: int = 6,
-        font=None,  # noqa: A002
+        label_font=None,
     ) -> tk.Label:
         """Return a Label styled as a clickable button."""
-        if font is None:
-            font = self.font_body  # noqa: A001
-        btn = tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
+        if label_font is None:
+            label_font = self.font_body
+        btn = tk.Label(parent, text=text, bg=bg, fg=fg, font=label_font,
                        padx=padx, pady=pady, cursor="hand2", relief="flat")
         btn.bind("<Button-1>", lambda e: command())
         btn.bind("<Enter>", lambda e: btn.config(bg=self._darken(bg, 12)))
@@ -594,8 +594,10 @@ class App(tk.Tk):
             analyzer = ErrorLogAnalyzer(llm_client=llm)
             result = analyzer.analyze(error_log=error_log, rtl_files=rtl_files)
             self.after(0, self._on_analysis_success, result.analysis)
-        except Exception as exc:  # noqa: BLE001
+        except (ImportError, OSError, ValueError, RuntimeError) as exc:
             self.after(0, self._on_analysis_error, str(exc))
+        except Exception as exc:  # noqa: BLE001 — catch-all for unexpected LLM/network errors
+            self.after(0, self._on_analysis_error, f"Unexpected error: {exc}")
 
     def _on_analysis_success(self, analysis: str) -> None:
         self._set_analyzing(False)
