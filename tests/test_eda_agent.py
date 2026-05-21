@@ -299,5 +299,215 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+# ---------------------------------------------------------------------------
+# RTL Searcher tests
+# ---------------------------------------------------------------------------
+
+
+class TestCollectRtlFiles(unittest.TestCase):
+    def test_collects_sv_files(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with TemporaryDirectory() as tmp:
+            sv_file = Path(tmp) / "design.sv"
+            sv_file.write_text("module top(); endmodule")
+            result = collect_rtl_files(tmp)
+
+        self.assertIn("design.sv", result)
+        self.assertEqual(result["design.sv"], "module top(); endmodule")
+
+    def test_collects_v_and_svh_files(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / "a.v").write_text("module a(); endmodule")
+            (Path(tmp) / "b.svh").write_text("`define WIDTH 8")
+            result = collect_rtl_files(tmp)
+
+        self.assertIn("a.v", result)
+        self.assertIn("b.svh", result)
+
+    def test_ignores_non_rtl_files(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / "notes.txt").write_text("some notes")
+            (Path(tmp) / "design.sv").write_text("module x(); endmodule")
+            result = collect_rtl_files(tmp)
+
+        self.assertNotIn("notes.txt", result)
+        self.assertIn("design.sv", result)
+
+    def test_raises_for_missing_directory(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with self.assertRaises(NotADirectoryError):
+            collect_rtl_files("/nonexistent/path")
+
+    def test_returns_empty_dict_when_no_rtl_files(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with TemporaryDirectory() as tmp:
+            result = collect_rtl_files(tmp)
+
+        self.assertEqual(result, {})
+
+    def test_recursive_collection(self):
+        from eda_agent.utils.rtl_searcher import collect_rtl_files
+
+        with TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            (sub / "inner.sv").write_text("module inner(); endmodule")
+            result = collect_rtl_files(tmp)
+
+        # Key should be the relative path
+        self.assertIn("sub/inner.sv", result)
+
+
+class TestFormatRtlContext(unittest.TestCase):
+    def test_empty_returns_placeholder(self):
+        from eda_agent.utils.rtl_searcher import format_rtl_context
+
+        self.assertEqual(format_rtl_context({}), "(no RTL files found)")
+
+    def test_includes_filename_and_content(self):
+        from eda_agent.utils.rtl_searcher import format_rtl_context
+
+        result = format_rtl_context({"design.sv": "module top(); endmodule"})
+        self.assertIn("design.sv", result)
+        self.assertIn("module top(); endmodule", result)
+
+    def test_multiple_files_are_separated(self):
+        from eda_agent.utils.rtl_searcher import format_rtl_context
+
+        result = format_rtl_context({"a.sv": "module a();", "b.sv": "module b();"})
+        self.assertIn("a.sv", result)
+        self.assertIn("b.sv", result)
+
+
+# ---------------------------------------------------------------------------
+# ErrorLogAnalyzer tests
+# ---------------------------------------------------------------------------
+
+
+class TestErrorLogAnalyzer(unittest.TestCase):
+    def _make_analyzer(self, analysis_text: str = "Root cause: wire width mismatch"):
+        from eda_agent.analyzers.error_log_analyzer import ErrorLogAnalyzer
+
+        mock_llm = MagicMock()
+        mock_llm.chat.return_value = analysis_text
+        return ErrorLogAnalyzer(llm_client=mock_llm), mock_llm
+
+    def test_analyze_returns_error_analysis_result(self):
+        from eda_agent.analyzers.error_log_analyzer import ErrorAnalysisResult
+
+        analyzer, _ = self._make_analyzer()
+        result = analyzer.analyze(error_log="ERROR: ...", rtl_files={})
+        self.assertIsInstance(result, ErrorAnalysisResult)
+
+    def test_analyze_populates_analysis_field(self):
+        analyzer, _ = self._make_analyzer("Root cause: wire width mismatch")
+        result = analyzer.analyze(error_log="ERROR: ...", rtl_files={})
+        self.assertEqual(result.analysis, "Root cause: wire width mismatch")
+
+    def test_analyze_preserves_error_log(self):
+        analyzer, _ = self._make_analyzer()
+        log = "ERROR: undeclared identifier 'cnt'"
+        result = analyzer.analyze(error_log=log, rtl_files={})
+        self.assertEqual(result.error_log, log)
+
+    def test_analyze_passes_error_log_to_llm(self):
+        analyzer, mock_llm = self._make_analyzer()
+        analyzer.analyze(error_log="my error log", rtl_files={})
+        _, kwargs = mock_llm.chat.call_args
+        self.assertIn("my error log", kwargs["user"])
+
+    def test_analyze_passes_rtl_content_to_llm(self):
+        analyzer, mock_llm = self._make_analyzer()
+        analyzer.analyze(
+            error_log="err", rtl_files={"design.sv": "module top(); endmodule"}
+        )
+        _, kwargs = mock_llm.chat.call_args
+        self.assertIn("module top(); endmodule", kwargs["user"])
+
+    def test_analyze_uses_error_log_system_prompt(self):
+        from eda_agent.prompts.error_log_prompts import ERROR_LOG_SYSTEM_PROMPT
+
+        analyzer, mock_llm = self._make_analyzer()
+        analyzer.analyze(error_log="err", rtl_files={})
+        _, kwargs = mock_llm.chat.call_args
+        self.assertEqual(kwargs["system"], ERROR_LOG_SYSTEM_PROMPT)
+
+    def test_analyze_preserves_rtl_files(self):
+        analyzer, _ = self._make_analyzer()
+        rtl = {"design.sv": "module top(); endmodule"}
+        result = analyzer.analyze(error_log="err", rtl_files=rtl)
+        self.assertEqual(result.rtl_files, rtl)
+
+    @patch("eda_agent.analyzers.error_log_analyzer.LLMClient")
+    def test_default_llm_client_created_when_not_supplied(self, mock_llm_cls):
+        from eda_agent.analyzers.error_log_analyzer import ErrorLogAnalyzer
+
+        mock_llm_cls.return_value = MagicMock()
+        mock_llm_cls.return_value.chat.return_value = "analysis"
+        ErrorLogAnalyzer(model="gpt-3.5-turbo")
+        mock_llm_cls.assert_called_once_with(model="gpt-3.5-turbo")
+
+
+# ---------------------------------------------------------------------------
+# CLI analysis-mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestCLIAnalysisMode(unittest.TestCase):
+    @patch("main.ErrorLogAnalyzer")
+    @patch("main.collect_rtl_files")
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"})
+    def test_analyze_error_flag(self, mock_collect, mock_analyzer_cls):
+        from main import main
+
+        mock_collect.return_value = {}
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        mock_analyzer.analyze.return_value = MagicMock(analysis="Root cause: ...")
+
+        with TemporaryDirectory() as tmp:
+            rc = main(["--analyze-error", "ERROR: ...", "--rtl-dir", tmp])
+        self.assertEqual(rc, 0)
+        mock_analyzer.analyze.assert_called_once()
+
+    @patch("main.ErrorLogAnalyzer")
+    @patch("main.collect_rtl_files")
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"})
+    def test_analyze_error_file_flag(self, mock_collect, mock_analyzer_cls):
+        from main import main
+
+        mock_collect.return_value = {}
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        mock_analyzer.analyze.return_value = MagicMock(analysis="analysis text")
+
+        with TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "sim.log"
+            log_file.write_text("ERROR: undeclared identifier")
+            rc = main(["--analyze-error-file", str(log_file), "--rtl-dir", tmp])
+        self.assertEqual(rc, 0)
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"})
+    def test_analyze_error_missing_rtl_dir_returns_error(self):
+        from main import main
+
+        rc = main(["--analyze-error", "ERROR: ...", "--rtl-dir", "/nonexistent"])
+        self.assertEqual(rc, 1)
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"})
+    def test_analyze_error_file_not_found_returns_error(self):
+        from main import main
+
+        rc = main(["--analyze-error-file", "/nonexistent/sim.log"])
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
